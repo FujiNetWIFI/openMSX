@@ -115,12 +115,12 @@ uint8_t FujiNet::readMem(uint16_t address, EmuTime time)
             return 0x00;
         case IO_STATUS_ADDR:
             if (!rxBuffer.empty()) {
-                getCliComm().printInfo("FujiNet: STAT -> data available");
+                // getCliComm().printInfo("FujiNet: STAT -> data available");
                 return 0b10000000; // data available
 			}
-			else {
-    			getCliComm().printInfo("FujiNet: STAT -> no data");
-			}
+			// else {
+    			// getCliComm().printInfo("FujiNet: STAT -> no data");
+			// }
             return 0x00;
         default:
             if (0x4000 <= address && address < 0xC000) {
