@@ -146,9 +146,9 @@ std::unique_ptr<FujiBusPacket> FujiNet::readBusPacket()
 void FujiNet::fujiBusAck()
 {
     if (sock != OPENMSX_INVALID_SOCKET) {
-        FujiBusPacket packet(FUJI_DEVICEID_DBC, FUJICMD_ACK, "");
-        auto data = packet.serialize();
-        auto res = sock_send(sock, reinterpret_cast<const char*>(&data), data.size());
+        FujiBusPacket packet(FUJI_DEVICEID_DBC, FUJICMD_ACK);
+        auto buf = packet.serialize();
+        auto res = sock_send(sock, (const char*)buf.data(), buf.size());
         (void)res; // ignore error
     }
 }
