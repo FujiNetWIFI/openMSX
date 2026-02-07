@@ -11,7 +11,7 @@
 #include <sys/fcntl.h>
 #include <stdio.h>
 
-#define FUJINET_DEFAULT_PORT     65504
+#define FUJINET_DEFAULT_PORT     1985
 
 namespace openmsx {
 
