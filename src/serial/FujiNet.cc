@@ -1,3 +1,4 @@
+#undef UNUSED
 #include "FujiNet.hh"
 #include "FujiBusPacket.h"
 #include "Timer.hh"
@@ -29,6 +30,7 @@ FujiNet::FujiNet(DeviceConfig& config)
     thread = std::thread(&FujiNet::readSocket, this);
     stopReading = false;
     userRomEnabled = false;
+    userRomLoaded = false;
 }
 
 FujiNet::~FujiNet()
@@ -52,7 +54,9 @@ void FujiNet::close()
 
 void FujiNet::readSocket()
 {
+    #ifdef UNUSED
     getCliComm().printInfo("FujiNet: Start read loop");
+    #endif
     char buf[MAX_BUF_LEN];
 
     while (!stopReading) {
@@ -86,9 +90,11 @@ void FujiNet::readSocket()
 			continue;
 		}
 		else if (n > 0) {
+            #ifdef UNUSED
             getCliComm().printInfo("FujiNet: Read ", n, " bytes from pty");
             std::string str(buf, n);
             getCliComm().printInfo(str);
+            #endif
             std::lock_guard lock(mtx);
             for (auto i : xrange(std::min<size_t>(n, MAX_BUF_LEN - rxBuffer.size()))) {
                 rxBuffer.push_back(buf[i]);
@@ -113,20 +119,26 @@ void FujiNet::handleDBCCommand(std::unique_ptr<FujiBusPacket> packet)
 
     switch (packet->command()) {
         case FUJICMD_OPEN:
+            #ifdef UNUSED
             getCliComm().printInfo("FUJICMD_OPEN");
+            #endif
             clearUserROM();
             fujiBusAck();
             break;
         case FUJICMD_WRITE:
+            #ifdef UNUSED
             getCliComm().printInfo("FUJICMD_WRITE");
+            #endif
             if (packet->data())
                 writeUserROM(*(packet->data()));
             fujiBusAck();
             break;
         case FUJICMD_CLOSE:
+            #ifdef UNUSED
             getCliComm().printInfo("FUJICMD_CLOSE");
+            #endif
             if (userRom.size())
-                enableUserROM();
+                readyUserROM();
             fujiBusAck();
             break;
         default:
@@ -155,6 +167,7 @@ void FujiNet::fujiBusAck()
 
 void FujiNet::clearUserROM()
 {
+    userRomLoaded = false;
     userRom.clear();
 }
 
@@ -163,6 +176,11 @@ void FujiNet::writeUserROM(std::span<unsigned const char> data)
     for (auto c : data) {
         userRom.push_back(c);
     }
+}
+
+void FujiNet::readyUserROM()
+{
+    userRomLoaded = true;
 }
 
 void FujiNet::enableUserROM()
@@ -182,13 +200,16 @@ void FujiNet::reset(EmuTime /*time*/)
 
 uint8_t FujiNet::readMem(uint16_t address, EmuTime time)
 {
+    #ifdef UNUSED
 	getCliComm().printInfo("FujiNet: readMem() ", address);
+    #endif
 	auto value = peekMem(address, time);
 	switch (address) {
 		case IO_GETC_ADDR:
 			if (!rxBuffer.empty()) {
 				std::lock_guard lock(mtx);
 				rxBuffer.pop_front();
+                #ifdef UNUSED
 				char formatted[16];
 				if (value > 31 && value < 127) {
 					sprintf(formatted, "$%02X %c", value, value);
@@ -196,23 +217,31 @@ uint8_t FujiNet::readMem(uint16_t address, EmuTime time)
 					sprintf(formatted, "$%02X", value);
 				}
 				getCliComm().printInfo("FujiNet: GETC -> ", formatted);
+                #endif
 			} else {
+                #ifdef UNUSED
 				getCliComm().printInfo("FujiNet: GETC -> empty!");
+                #endif
 			}
 			break;
 		case IO_STATUS_ADDR:
+            #ifdef UNUSED
 			if (value == 0b10000000) {
 				getCliComm().printInfo("FujiNet: STAT -> data available");
 			} else {
 				getCliComm().printInfo("FujiNet: STAT -> no data");
 			}
+            #endif
+            ;
 	}
 	return value;
 }
 
 uint8_t FujiNet::peekMem(uint16_t address, EmuTime /*time*/) const
 {
+    #ifdef UNUSED
 	getCliComm().printInfo("FujiNet: peekMem() ", address);
+    #endif
 	switch (address) {
 		case IO_GETC_ADDR: {
 			std::lock_guard lock(mtx);
@@ -222,11 +251,15 @@ uint8_t FujiNet::peekMem(uint16_t address, EmuTime /*time*/) const
 			return 0x00;
 		}
 		case IO_STATUS_ADDR: {
+            // bit 7 when 1 means data available
+            // bit 6 when 1 means user rom is ready
+            // bit 6 when 0 means user rom is not ready
 			std::lock_guard lock(mtx);
+			uint8_t status = (userRomLoaded ? 0x40 : 0x00);
 			if (!rxBuffer.empty()) {
-				return 0x80; // data available
+				status |= 0x80;
 			}
-			return 0x00;
+			return status;
 		}
 		default:
 			if (address < 0x4000 || 0xC000 <= address) return 0xFF;
@@ -241,11 +274,13 @@ void FujiNet::writeMem(uint16_t address, uint8_t value, EmuTime /*time*/)
     switch (address) {
         case IO_PUTC_ADDR: // IO_PUTC
             if (sock != OPENMSX_INVALID_SOCKET) {
+                #ifdef UNUSED
                 char formatted[16];
                 if (value > 31 && value < 127)
                     sprintf(formatted, "$%02X %c", value, value);
                 else
                     sprintf(formatted, "$%02X", value);
+                #endif
                 // getCliComm().printInfo("FujiNet: PUTC ", formatted);
 
                 // txBuffer.push_back(value);
@@ -275,6 +310,17 @@ void FujiNet::writeMem(uint16_t address, uint8_t value, EmuTime /*time*/)
 
                 auto res = sock_send(sock, reinterpret_cast<const char*>(&value), 1);
                 (void)res; // ignore error
+            }
+            return;
+        case IO_CONTROL_ADDR:
+            // when writing if bit 7 is high that signals "switch rom to bank"
+            // bits 6~1 is reserved and must be 0
+            // when bit 0 is 1 that means switching to user rom 
+            // when bit 0 is 0 that means switching to config rom
+            if (value == 0x81) {
+                enableUserROM();
+            } else if (value == 0x80){
+                disableUserROM();
             }
             return;
         default:
