@@ -26,6 +26,9 @@ FujiNet::FujiNet(DeviceConfig& config)
     : MSXDevice(config)
     , rom(getName() + " ROM", "rom", config)
     , userRom(0)
+    , debugMode(
+        getCommandController(), "fujinet_debug",
+        "Enable FujiNet debug logging", false)
 {
     thread = std::thread(&FujiNet::readSocket, this);
     stopReading = false;
@@ -54,9 +57,9 @@ void FujiNet::close()
 
 void FujiNet::readSocket()
 {
-    #ifdef UNUSED
-    getCliComm().printInfo("FujiNet: Start read loop");
-    #endif
+    if (debugMode.getBoolean()) {
+        getCliComm().printInfo("FujiNet: Start read loop");
+    }
     char buf[MAX_BUF_LEN];
 
     while (!stopReading) {
@@ -90,11 +93,11 @@ void FujiNet::readSocket()
 			continue;
 		}
 		else if (n > 0) {
-            #ifdef UNUSED
-            getCliComm().printInfo("FujiNet: Read ", n, " bytes from pty");
-            std::string str(buf, n);
-            getCliComm().printInfo(str);
-            #endif
+            if (debugMode.getBoolean()) {
+                getCliComm().printInfo("FujiNet: Read ", n, " bytes from pty");
+                std::string str(buf, n);
+                getCliComm().printInfo(str);
+            }
             std::lock_guard lock(mtx);
             for (auto i : xrange(std::min<size_t>(n, MAX_BUF_LEN - rxBuffer.size()))) {
                 rxBuffer.push_back(buf[i]);
@@ -119,24 +122,24 @@ void FujiNet::handleDBCCommand(std::unique_ptr<FujiBusPacket> packet)
 
     switch (packet->command()) {
         case FUJICMD_OPEN:
-            #ifdef UNUSED
-            getCliComm().printInfo("FUJICMD_OPEN");
-            #endif
+            if (debugMode.getBoolean()) {
+                getCliComm().printInfo("FUJICMD_OPEN");
+            }
             clearUserROM();
             fujiBusAck();
             break;
         case FUJICMD_WRITE:
-            #ifdef UNUSED
-            getCliComm().printInfo("FUJICMD_WRITE");
-            #endif
+            if (debugMode.getBoolean()) {
+                getCliComm().printInfo("FUJICMD_WRITE");
+            }
             if (packet->data())
                 writeUserROM(*(packet->data()));
             fujiBusAck();
             break;
         case FUJICMD_CLOSE:
-            #ifdef UNUSED
-            getCliComm().printInfo("FUJICMD_CLOSE");
-            #endif
+            if (debugMode.getBoolean()) {
+                getCliComm().printInfo("FUJICMD_CLOSE");
+            }
             if (userRom.size())
                 readyUserROM();
             fujiBusAck();
@@ -200,38 +203,38 @@ void FujiNet::reset(EmuTime /*time*/)
 
 uint8_t FujiNet::readMem(uint16_t address, EmuTime time)
 {
-    #ifdef UNUSED
-	getCliComm().printInfo("FujiNet: readMem() ", address);
-    #endif
+    if (debugMode.getBoolean()) {
+        getCliComm().printInfo("FujiNet: readMem() ", address);
+    }
 	auto value = peekMem(address, time);
 	switch (address) {
 		case IO_GETC_ADDR:
 			if (!rxBuffer.empty()) {
 				std::lock_guard lock(mtx);
 				rxBuffer.pop_front();
-                #ifdef UNUSED
-				char formatted[16];
-				if (value > 31 && value < 127) {
-					sprintf(formatted, "$%02X %c", value, value);
-				} else {
-					sprintf(formatted, "$%02X", value);
-				}
-				getCliComm().printInfo("FujiNet: GETC -> ", formatted);
-                #endif
+                if (debugMode.getBoolean()) {
+                    char formatted[16];
+                    if (value > 31 && value < 127) {
+                        sprintf(formatted, "$%02X %c", value, value);
+                    } else {
+                        sprintf(formatted, "$%02X", value);
+                    }
+                    getCliComm().printInfo("FujiNet: GETC -> ", formatted);
+                }
 			} else {
-                #ifdef UNUSED
-				getCliComm().printInfo("FujiNet: GETC -> empty!");
-                #endif
+                if (debugMode.getBoolean()) {
+                    getCliComm().printInfo("FujiNet: GETC -> empty!");
+                }
 			}
 			break;
 		case IO_STATUS_ADDR:
-            #ifdef UNUSED
-			if (value == 0b10000000) {
-				getCliComm().printInfo("FujiNet: STAT -> data available");
-			} else {
-				getCliComm().printInfo("FujiNet: STAT -> no data");
-			}
-            #endif
+            if (debugMode.getBoolean()) {
+                if (value == 0b10000000) {
+                    getCliComm().printInfo("FujiNet: STAT -> data available");
+                } else {
+                    getCliComm().printInfo("FujiNet: STAT -> no data");
+                }
+            }
             ;
 	}
 	return value;
@@ -239,9 +242,9 @@ uint8_t FujiNet::readMem(uint16_t address, EmuTime time)
 
 uint8_t FujiNet::peekMem(uint16_t address, EmuTime /*time*/) const
 {
-    #ifdef UNUSED
-	getCliComm().printInfo("FujiNet: peekMem() ", address);
-    #endif
+    if (debugMode.getBoolean()) {
+        getCliComm().printInfo("FujiNet: peekMem() ", address);
+    }
 	switch (address) {
 		case IO_GETC_ADDR: {
 			std::lock_guard lock(mtx);
@@ -274,14 +277,14 @@ void FujiNet::writeMem(uint16_t address, uint8_t value, EmuTime /*time*/)
     switch (address) {
         case IO_PUTC_ADDR: // IO_PUTC
             if (sock != OPENMSX_INVALID_SOCKET) {
-                #ifdef UNUSED
-                char formatted[16];
-                if (value > 31 && value < 127)
-                    sprintf(formatted, "$%02X %c", value, value);
-                else
-                    sprintf(formatted, "$%02X", value);
-                #endif
-                // getCliComm().printInfo("FujiNet: PUTC ", formatted);
+                if (debugMode.getBoolean()) {
+                    char formatted[16];
+                    if (value > 31 && value < 127)
+                        sprintf(formatted, "$%02X %c", value, value);
+                    else
+                        sprintf(formatted, "$%02X", value);
+                    getCliComm().printInfo("FujiNet: PUTC ", formatted);
+                }
 
                 // txBuffer.push_back(value);
                 // if (value == SLIP_END) {

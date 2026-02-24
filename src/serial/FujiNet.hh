@@ -8,6 +8,7 @@
 #include "Socket.hh"
 #include "Rom.hh"
 #include "Poller.hh"
+#include "BooleanSetting.hh"
 
 #include "circular_buffer.hh"
 
@@ -52,6 +53,7 @@ private:
 	std::vector<std::uint8_t> userRom;
 	bool userRomEnabled;
 	bool userRomLoaded;
+	BooleanSetting debugMode;
 	std::thread thread; // receiving thread (reads from pty)
 	Poller poller; // to abort read-thread in a portable way
 	mutable std::mutex mtx; // to protect shared data between emulation and receiving thread
