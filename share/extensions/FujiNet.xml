@@ -12,18 +12,10 @@
     <primary slot="any">
       <secondary slot="any">
         <FujiNet id="FujiNet">
-          <!-- <io base="0x56" num="1" />
-          <io base="0x57" num="1" />
-          <io base="0x5A" num="1" /> -->
-        <!-- </FujiNet> -->
-        <!-- <ROM id="FujiNet ROM"> -->
           <mem base="0x4000" size="0x8000" />
           <rom>
-            <!-- <sha1>55da0135dbccd8425826aeb7c80819c894224ff0</sha1> -->
-            <!-- <sha1>a4c5074f5ce3f3667dcc1261deaa64603b22fa47</sha1> -->
             <filename>fujinet-config.rom</filename>
           </rom>
-        <!-- </ROM> -->
         </FujiNet>
       </secondary>
     </primary>

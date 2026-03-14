@@ -5,6 +5,7 @@
 
 #include "GlobalSettings.hh"
 #include "fujiDeviceID.h"
+#include "fujiRomType.h"
 #include "serialize.hh"
 #include <cstddef>
 #include <cstdint>
@@ -20,11 +21,15 @@
 
 namespace openmsx {
 
-static constexpr size_t MAX_BUF_LEN     = 2 * 1024;
+// static constexpr size_t MAX_BUF_LEN     = 2 * 1024;
+static constexpr size_t MAX_BUF_LEN     = 0x40000;
 static constexpr size_t IO_GETC_ADDR    = 0xBFFC;
 static constexpr size_t IO_STATUS_ADDR  = 0xBFFD;
 static constexpr size_t IO_PUTC_ADDR    = 0xBFFE;
 static constexpr size_t IO_CONTROL_ADDR = 0xBFFF;
+static constexpr size_t IO_FLAG_USERROM_READY   = 0x40;
+static constexpr size_t IO_FLAG_ROM_MODE_CMD    = 0b00000100;
+static constexpr size_t IO_FLAG_USERROM_ENABLE  = 0b00000001;
 
 FujiNet::FujiNet(DeviceConfig& config)
     : MSXDevice(config)
@@ -36,8 +41,11 @@ FujiNet::FujiNet(DeviceConfig& config)
 {
     thread = std::thread(&FujiNet::readSocket, this);
     stopReading = false;
+
     userRomEnabled = false;
     userRomLoaded = false;
+    userRomType = FUJI_ROM_MSX_PLAIN;
+    userRomBankSize = 0x4000;
 }
 
 FujiNet::~FujiNet()
@@ -51,6 +59,13 @@ FujiNet::~FujiNet()
     }
 }
 
+template <typename... Args>
+void FujiNet::fnDebugLog(Args&&... args) {
+    if (debugMode.getBoolean()) {
+        getCliComm().printInfo(std::forward<Args>(args)...);
+    }
+}
+
 void FujiNet::close()
 {
 	auto oldSock = sock.exchange(OPENMSX_INVALID_SOCKET);
@@ -61,9 +76,7 @@ void FujiNet::close()
 
 void FujiNet::readSocket()
 {
-    if (debugMode.getBoolean()) {
-        getCliComm().printInfo("FujiNet: Start read loop");
-    }
+    fnDebugLog("FujiNet: Start read loop");
     char buf[MAX_BUF_LEN];
 
     while (!stopReading) {
@@ -98,9 +111,9 @@ void FujiNet::readSocket()
 		}
 		else if (n > 0) {
             if (debugMode.getBoolean()) {
-                getCliComm().printInfo("FujiNet: Read ", n, " bytes from pty");
+                fnDebugLog("FujiNet: Read ", n, " bytes from pty");
                 std::string str(buf, n);
-                getCliComm().printInfo(str);
+                fnDebugLog(str);
             }
             std::lock_guard lock(mtx);
             for (auto i : xrange(std::min<size_t>(n, MAX_BUF_LEN - rxBuffer.size()))) {
@@ -126,24 +139,21 @@ void FujiNet::handleDBCCommand(std::unique_ptr<FujiBusPacket> packet)
 
     switch (packet->command()) {
         case FUJICMD_OPEN:
-            if (debugMode.getBoolean()) {
-                getCliComm().printInfo("FUJICMD_OPEN");
-            }
+            fnDebugLog("FUJICMD_OPEN");
             clearUserROM();
+            // TODO: Also set offset from first param
+            fnDebugLog("fujiROMType: ", packet->param(1));
+            setUserROMType((fujiROMType_t)packet->param(1));
             fujiBusAck();
             break;
         case FUJICMD_WRITE:
-            if (debugMode.getBoolean()) {
-                getCliComm().printInfo("FUJICMD_WRITE");
-            }
+            fnDebugLog("FUJICMD_WRITE");
             if (packet->data())
                 writeUserROM(*(packet->data()));
             fujiBusAck();
             break;
         case FUJICMD_CLOSE:
-            if (debugMode.getBoolean()) {
-                getCliComm().printInfo("FUJICMD_CLOSE");
-            }
+            fnDebugLog("FUJICMD_CLOSE");
             if (userRom.size())
                 readyUserROM();
             fujiBusAck();
@@ -187,17 +197,95 @@ void FujiNet::writeUserROM(std::span<unsigned const char> data)
 
 void FujiNet::readyUserROM()
 {
+    fnDebugLog("FujiNet: readyUserROM");
     userRomLoaded = true;
 }
 
 void FujiNet::enableUserROM()
 {
+    fnDebugLog("FujiNet: enabledUserROM");
     userRomEnabled = true;
 }
 
 void FujiNet::disableUserROM()
 {
+    fnDebugLog("FujiNet: disableUserROM");
     userRomEnabled = false;
+}
+
+void FujiNet::setUserROMType(fujiROMType_t t)
+{
+    userRomType = t;
+
+    switch (userRomType) {
+        case FUJI_ROM_MSX_ASCII8:
+        case FUJI_ROM_MSX_KONAMI:
+        case FUJI_ROM_MSX_KONAMI_SCC:
+            userRomBankSize = 0x2000;
+            break;
+        default:
+            userRomBankSize = 0x4000;
+            break;
+    }
+
+    // Reset all banks to sequential
+    for (uint8_t n = 0; n < MAX_BANKS; n++) {
+        setUserROMBank(n, n);
+    }
+}
+
+void FujiNet::setUserROMBank(uint8_t n, uint8_t block)
+{
+    uint32_t offset = block * userRomBankSize;
+    userRomMap[n] = offset;
+    char offset_str[8];
+    snprintf(offset_str, 8, "%04X", offset);
+    fnDebugLog("FujiNet: setUserROMBank n:", n, " block:", block, " offset:", offset_str);
+}
+
+void FujiNet::handleBankSwitch(uint16_t address, uint8_t value)
+{
+    char addr_str[8];
+    snprintf(addr_str, 8, "%04X", address);
+    fnDebugLog("FujiNet: handleBankSwitch addr:", addr_str, " val:", value, " userRomType:", (uint8_t)userRomType);
+
+    if (address < 0x4000 || address >= 0xC000)
+        return;
+
+    switch (userRomType) {
+        case FUJI_ROM_MSX_ASCII8:
+            if ((0x6000 <= address) && (address < 0x8000)) {
+                uint8_t bank = ((address >> 11) & 3);
+                setUserROMBank(bank, value);
+            }
+            break;
+
+        case FUJI_ROM_MSX_ASCII16:
+            if ((0x6000 <= address) && (address < 0x7800) && !(address & 0x0800)) {
+          		uint8_t bank = ((address >> 12) & 1);
+                setUserROMBank(bank, value);
+           	}
+            break;
+
+        case FUJI_ROM_MSX_KONAMI:
+            // Note: [0x4000..0x6000) is fixed at segment 0.
+           	if (0x6000 <= address && address < 0xC000) {
+                uint8_t bank = (address >> 13) - 2;
+          		setUserROMBank(bank, value);
+           	}
+            break;
+
+        case FUJI_ROM_MSX_KONAMI_SCC: // Konami+SCC; TODO: use real enum
+           	if (0x5000 <= address && address < 0xC000 && (address & 0x1800) == 0x1000) {
+          		uint8_t bank = (address >> 13) - 2;
+          		setUserROMBank(bank, value);
+          		// TODO: if bank = 4 clear SCC cache
+           	}
+            break;
+
+        default:
+            break;
+    }
 }
 
 void FujiNet::reset(EmuTime /*time*/)
@@ -208,8 +296,13 @@ void FujiNet::reset(EmuTime /*time*/)
 uint8_t FujiNet::readMem(uint16_t address, EmuTime time)
 {
     if (debugMode.getBoolean()) {
-        getCliComm().printInfo("FujiNet: readMem() ", address);
+        // getCliComm().printInfo("FujiNet: readMem() ", address);
     }
+
+    if (userRomEnabled) {
+        return peekUserROM(address);
+    }
+
 	auto value = peekMem(address, time);
 	switch (address) {
 		case IO_GETC_ADDR:
@@ -219,36 +312,31 @@ uint8_t FujiNet::readMem(uint16_t address, EmuTime time)
                 if (debugMode.getBoolean()) {
                     char formatted[16];
                     if (value > 31 && value < 127) {
-                        sprintf(formatted, "$%02X %c", value, value);
+                        snprintf(formatted, 16, "$%02X %c", value, value);
                     } else {
-                        sprintf(formatted, "$%02X", value);
+                        snprintf(formatted, 16, "$%02X", value);
                     }
-                    getCliComm().printInfo("FujiNet: GETC -> ", formatted);
+                    fnDebugLog("FujiNet: GETC -> ", formatted);
                 }
 			} else {
-                if (debugMode.getBoolean()) {
-                    getCliComm().printInfo("FujiNet: GETC -> empty!");
-                }
+    			fnDebugLog("FujiNet: GETC -> empty!");
 			}
 			break;
 		case IO_STATUS_ADDR:
-            if (debugMode.getBoolean()) {
-                if (value == 0b10000000) {
-                    getCliComm().printInfo("FujiNet: STAT -> data available");
-                } else {
-                    getCliComm().printInfo("FujiNet: STAT -> no data");
-                }
+            if (value == 0b10000000) {
+                fnDebugLog("FujiNet: STAT -> data available");
+            } else {
+                fnDebugLog("FujiNet: STAT -> no data");
             }
-            ;
+            break;
 	}
 	return value;
 }
 
 uint8_t FujiNet::peekMem(uint16_t address, EmuTime /*time*/) const
 {
-    if (debugMode.getBoolean()) {
-        getCliComm().printInfo("FujiNet: peekMem() ", address);
-    }
+    // fnDebugLog("FujiNet: peekMem() ", address);
+
 	switch (address) {
 		case IO_GETC_ADDR: {
 			std::lock_guard lock(mtx);
@@ -269,69 +357,70 @@ uint8_t FujiNet::peekMem(uint16_t address, EmuTime /*time*/) const
 			return status;
 		}
 		default:
-			if (address < 0x4000 || 0xC000 <= address) return 0xFF;
-			return userRomEnabled ? userRom[address - 0x4000] : rom[address - 0x4000];
+			if (address < 0x4000 || 0xC000 <= address)
+                return 0xFF;
+		    return rom[address - 0x4000];
+
 	}
+}
+
+uint8_t FujiNet::peekUserROM(uint16_t address)
+{
+    switch (userRomType) {
+        case FUJI_ROM_MSX_KONAMI:
+            // [0x0000, 0x4000) mirrors [0x4000, 0x8000)
+            if (address < 0x4000) address += 0x4000;
+            // [0xC000, 0x10000) mirrors [0x8000, 0xC000)
+            else if (address >= 0xC000) address -= 0x4000;
+            break;
+
+        case FUJI_ROM_MSX_KONAMI_SCC:
+            // [0x0000, 0x4000) mirrors [0xC000, 0x10000)
+            if (address < 0x4000) address += 0x8000;
+            // [0xC000, 0x10000) mirrors [0x4000, 0x8000)
+            else if (address >= 0xC000) address -= 0x8000;
+            break;
+
+        default:
+            break;
+    }
+
+    uint16_t bank = (address - 0x4000) / userRomBankSize; // TODO: validate bank
+    uint32_t offset = userRomMap[bank];
+
+    return userRom[offset + address - 0x4000 - bank * userRomBankSize];
 }
 
 void FujiNet::writeMem(uint16_t address, uint8_t value, EmuTime /*time*/)
 {
     std::lock_guard lock(mtx);
-    // getCliComm().printInfo("FujiNet: writeMem() ", address, " ", value);
     switch (address) {
         case IO_PUTC_ADDR: // IO_PUTC
             if (sock != OPENMSX_INVALID_SOCKET) {
                 if (debugMode.getBoolean()) {
                     char formatted[16];
                     if (value > 31 && value < 127)
-                        sprintf(formatted, "$%02X %c", value, value);
+                        snprintf(formatted, 16, "$%02X %c", value, value);
                     else
-                        sprintf(formatted, "$%02X", value);
-                    getCliComm().printInfo("FujiNet: PUTC ", formatted);
+                        snprintf(formatted, 16, "$%02X", value);
+                    fnDebugLog("FujiNet: PUTC ", formatted);
                 }
-
-                // txBuffer.push_back(value);
-                // if (value == SLIP_END) {
-                //     if (inSLIPPacket) {
-                //         inSLIPPacket = false;
-
-                //         std::string packet = "";
-                //         for (auto c : txBuffer) {
-                //             packet.push_back(c);
-                //         }
-                //         auto tempFrame = FujiBusPacket::fromSerialized(packet);
-                //         if (tempFrame) {
-                //             char formatted[32];
-                //             sprintf(formatted, "\nCF: dev:%02x cmd:%02x dlen:%d\n",
-                //                         tempFrame->device(), tempFrame->command(),
-                //                         tempFrame->data() ? tempFrame->data()->size() : -1);
-                //             getCliComm().printInfo(formatted);
-                //         }
-
-                //         txBuffer.clear();
-                //     }
-                //     else {
-                //         inSLIPPacket = true;
-                //     }
-                // }
 
                 auto res = sock_send(sock, reinterpret_cast<const char*>(&value), 1);
                 (void)res; // ignore error
             }
             return;
         case IO_CONTROL_ADDR:
-            // when writing if bit 7 is high that signals "switch rom to bank"
-            // bits 6~1 is reserved and must be 0
-            // when bit 0 is 1 that means switching to user rom 
-            // when bit 0 is 0 that means switching to config rom
-            if (value == 0x81) {
-                enableUserROM();
-            } else if (value == 0x80){
-                disableUserROM();
+            if (value & IO_FLAG_ROM_MODE_CMD) {
+                if (value & IO_FLAG_USERROM_ENABLE)
+                    enableUserROM();
+                else
+                    disableUserROM();
             }
             return;
         default:
-            break;
+            handleBankSwitch(address, value);
+            return;
     }
 }
 
