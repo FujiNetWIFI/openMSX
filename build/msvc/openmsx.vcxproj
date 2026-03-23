@@ -945,6 +945,7 @@
     <ClCompile Include="$(OpenMSXSrcDir)\serial\DummyMidiOutDevice.cc" />
     <ClCompile Include="$(OpenMSXSrcDir)\serial\DummyRS232Device.cc" />
     <ClCompile Include="$(OpenMSXSrcDir)\serial\FujiNet.cc" />
+	<ClCompile Include="$(OpenMSXSrcDir)\serial\FujiBusPacket.cc" />
     <ClCompile Include="$(OpenMSXSrcDir)\serial\I8251.cc" />
     <ClCompile Include="$(OpenMSXSrcDir)\serial\I8254.cc" />
     <ClCompile Include="$(OpenMSXSrcDir)\serial\JVCMSXMIDI.cc" />
