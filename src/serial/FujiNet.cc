@@ -9,7 +9,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <sys/types.h>
+#ifdef _WIN32
+#include <fcntl.h>
+#else
 #include <sys/fcntl.h>
+#endif
 #include <stdio.h>
 
 #define FUJINET_DEFAULT_PORT     1985
