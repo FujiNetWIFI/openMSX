@@ -11,6 +11,7 @@
 #include "BooleanSetting.hh"
 
 #include "circular_buffer.hh"
+#include "fujiRomType.h"
 
 #include <cstdint>
 #include <mutex>
@@ -24,6 +25,8 @@ class FujiNet final
     : public MSXDevice
 {
 public:
+    static constexpr unsigned MAX_BANKS = 4;
+
 	explicit FujiNet(DeviceConfig& config);
 	~FujiNet() override;
 
@@ -48,11 +51,21 @@ private:
 	void readyUserROM();
 	void enableUserROM();
 	void disableUserROM();
+	void setUserROMType(fujiROMType_t t);
+	void setUserROMBank(uint8_t n, uint8_t block);
+	uint8_t peekUserROM(uint16_t address);
+	void handleBankSwitch(uint16_t address, uint8_t value);
+
+	template <typename... Args>
+	void fnDebugLog(Args&&... args);
 
 	Rom rom;
 	std::vector<std::uint8_t> userRom;
+	std::array<std::uint32_t, MAX_BANKS> userRomMap;
+	fujiROMType_t userRomType;
 	bool userRomEnabled;
 	bool userRomLoaded;
+	uint16_t userRomBankSize;
 	BooleanSetting debugMode;
 	std::thread thread; // receiving thread (reads from pty)
 	Poller poller; // to abort read-thread in a portable way
