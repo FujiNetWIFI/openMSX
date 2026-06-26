@@ -27,9 +27,10 @@ static constexpr size_t IO_GETC_ADDR    = 0xBFFC;
 static constexpr size_t IO_STATUS_ADDR  = 0xBFFD;
 static constexpr size_t IO_PUTC_ADDR    = 0xBFFE;
 static constexpr size_t IO_CONTROL_ADDR = 0xBFFF;
-static constexpr size_t IO_FLAG_USERROM_READY   = 0x40;
-static constexpr size_t IO_FLAG_ROM_MODE_CMD    = 0b00000100;
-static constexpr size_t IO_FLAG_USERROM_ENABLE  = 0b00000001;
+static constexpr size_t IO_FLAG_USERROM_READY       = 0x40;
+static constexpr size_t IO_FLAG_ROM_MODE_CMD        = 0b00000100;
+static constexpr size_t IO_FLAG_USERROM_ENABLE      = 0b00000001;
+static constexpr size_t IO_FLAG_AUTOSTART_ENABLE    = 0b00000010;
 
 FujiNet::FujiNet(DeviceConfig& config)
     : MSXDevice(config)
@@ -42,6 +43,7 @@ FujiNet::FujiNet(DeviceConfig& config)
     thread = std::thread(&FujiNet::readSocket, this);
     stopReading = false;
 
+    romEnabled = true;
     userRomEnabled = false;
     userRomLoaded = false;
     userRomType = FUJI_ROM_MSX_PLAIN;
@@ -213,6 +215,18 @@ void FujiNet::disableUserROM()
     userRomEnabled = false;
 }
 
+void FujiNet::enableROM()
+{
+    fnDebugLog("FujiNet: enabledROM");
+    romEnabled = true;
+}
+
+void FujiNet::disableROM()
+{
+    fnDebugLog("FujiNet: disableROM");
+    romEnabled = false;
+}
+
 void FujiNet::setUserROMType(fujiROMType_t t)
 {
     userRomType = t;
@@ -291,14 +305,11 @@ void FujiNet::handleBankSwitch(uint16_t address, uint8_t value)
 void FujiNet::reset(EmuTime /*time*/)
 {
     disableUserROM();
+    enableROM();
 }
 
 uint8_t FujiNet::readMem(uint16_t address, EmuTime time)
 {
-    if (debugMode.getBoolean()) {
-        // getCliComm().printInfo("FujiNet: readMem() ", address);
-    }
-
     if (userRomEnabled) {
         return peekUserROM(address);
     }
@@ -335,8 +346,6 @@ uint8_t FujiNet::readMem(uint16_t address, EmuTime time)
 
 uint8_t FujiNet::peekMem(uint16_t address, EmuTime /*time*/) const
 {
-    // fnDebugLog("FujiNet: peekMem() ", address);
-
 	switch (address) {
 		case IO_GETC_ADDR: {
 			std::lock_guard lock(mtx);
@@ -357,7 +366,7 @@ uint8_t FujiNet::peekMem(uint16_t address, EmuTime /*time*/) const
 			return status;
 		}
 		default:
-			if (address < 0x4000 || 0xC000 <= address)
+			if (!romEnabled || address < 0x4000 || 0xC000 <= address)
                 return 0xFF;
 		    return rom[address - 0x4000];
 
@@ -412,10 +421,18 @@ void FujiNet::writeMem(uint16_t address, uint8_t value, EmuTime /*time*/)
             return;
         case IO_CONTROL_ADDR:
             if (value & IO_FLAG_ROM_MODE_CMD) {
-                if (value & IO_FLAG_USERROM_ENABLE)
+                if (value & IO_FLAG_USERROM_ENABLE) {
                     enableUserROM();
-                else
+                }
+                else {
                     disableUserROM();
+                }
+                if (value & IO_FLAG_AUTOSTART_ENABLE) {
+                    enableROM();
+                }
+                else {
+                    disableROM();
+                }
             }
             return;
         default:

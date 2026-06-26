@@ -46,6 +46,8 @@ private:
 	void handleDBCCommand(std::unique_ptr<FujiBusPacket> packet);
 	void fujiBusAck();
 
+	void enableROM();
+	void disableROM();
 	void clearUserROM();
 	void writeUserROM(std::span<unsigned const char> data);
 	void readyUserROM();
@@ -60,6 +62,7 @@ private:
 	void fnDebugLog(Args&&... args);
 
 	Rom rom;
+	bool romEnabled;
 	std::vector<std::uint8_t> userRom;
 	std::array<std::uint32_t, MAX_BANKS> userRomMap;
 	fujiROMType_t userRomType;
