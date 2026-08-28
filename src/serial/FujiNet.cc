@@ -310,10 +310,12 @@ void FujiNet::reset(EmuTime /*time*/)
 
 uint8_t FujiNet::readMem(uint16_t address, EmuTime time)
 {
-    if (userRomEnabled) {
-        return peekUserROM(address);
-    }
-
+	// The IO window is decoded whether or not a user ROM is mapped in. On real
+	// hardware IO_BASE is a fixed decode, so a user ROM must never be able to
+	// hide IO_GETC/IO_STATUS behind its own contents: appmake pads MSX ROM
+	// images with 0xFF, which reads back as "data available" forever and hangs
+	// every client in its wait-for-SLIP_END loop. peekMem() falls through to
+	// the user ROM for every other address.
 	auto value = peekMem(address, time);
 	switch (address) {
 		case IO_GETC_ADDR:
@@ -366,6 +368,8 @@ uint8_t FujiNet::peekMem(uint16_t address, EmuTime /*time*/) const
 			return status;
 		}
 		default:
+			if (userRomEnabled)
+				return peekUserROM(address);
 			if (!romEnabled || address < 0x4000 || 0xC000 <= address)
                 return 0xFF;
 		    return rom[address - 0x4000];
@@ -373,7 +377,7 @@ uint8_t FujiNet::peekMem(uint16_t address, EmuTime /*time*/) const
 	}
 }
 
-uint8_t FujiNet::peekUserROM(uint16_t address)
+uint8_t FujiNet::peekUserROM(uint16_t address) const
 {
     switch (userRomType) {
         case FUJI_ROM_MSX_KONAMI:
@@ -394,10 +398,16 @@ uint8_t FujiNet::peekUserROM(uint16_t address)
             break;
     }
 
-    uint16_t bank = (address - 0x4000) / userRomBankSize; // TODO: validate bank
+    uint16_t bank = (address - 0x4000) / userRomBankSize;
+    if (bank >= MAX_BANKS) return 0xFF;
     uint32_t offset = userRomMap[bank];
 
-    return userRom[offset + address - 0x4000 - bank * userRomBankSize];
+    // A user ROM smaller than the mapped window (e.g. a 16K image seen at
+    // 0x8000..0xBFFF) would otherwise index past the end of the vector.
+    size_t idx = offset + address - 0x4000 - bank * userRomBankSize;
+    if (idx >= userRom.size()) return 0xFF;
+
+    return userRom[idx];
 }
 
 void FujiNet::writeMem(uint16_t address, uint8_t value, EmuTime /*time*/)
