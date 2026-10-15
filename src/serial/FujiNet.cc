@@ -144,8 +144,15 @@ void FujiNet::handleDBCCommand(std::unique_ptr<FujiBusPacket> packet)
             fnDebugLog("FUJICMD_OPEN");
             clearUserROM();
             // TODO: Also set offset from first param
-            fnDebugLog("fujiROMType: ", packet->param(1));
-            setUserROMType((fujiROMType_t)packet->param(1));
+            // FujiNet sends the type only for a tagged MSX megaROM
+            // ("game[ASCII8].rom"); anything else is a plain ROM.
+            {
+                auto type = packet->paramCount() > 1
+                          ? (fujiROMType_t)packet->param(1)
+                          : FUJI_ROM_MSX_PLAIN;
+                fnDebugLog("fujiROMType: ", (unsigned)type);
+                setUserROMType(type);
+            }
             fujiBusAck();
             break;
         case FUJICMD_WRITE:
