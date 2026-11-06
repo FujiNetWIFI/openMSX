@@ -478,12 +478,12 @@ int FujiNet::expandedSubSlot(uint16_t address) const
 	return (subSlotReg >> ((address >> 14) * 2)) & 3;
 }
 
-// The IO window sits in subslot 0 when expanded, and is hidden by the user
+// The IO window sits in subslot 1 when expanded, and is hidden by the user
 // ROM when not.
 bool FujiNet::windowLiveAt(uint16_t address) const
 {
 	if ((address < IO_GETC_ADDR) || (address > IO_CONTROL_ADDR)) return false;
-	if (slotExpanded) return expandedSubSlot(address) == 0;
+	if (slotExpanded) return expandedSubSlot(address) == 1;
 	return !userRomEnabled;
 }
 
@@ -491,7 +491,7 @@ bool FujiNet::windowLiveAt(uint16_t address) const
 bool FujiNet::userRomShownAt(uint16_t address) const
 {
 	if (!userRomEnabled) return false;
-	if (slotExpanded) return expandedSubSlot(address) == 1;
+	if (slotExpanded) return expandedSubSlot(address) == 0;
 	return !unapiEnabled;
 }
 
@@ -543,10 +543,11 @@ uint8_t FujiNet::peekMem(uint16_t address, EmuTime /*time*/) const
 	if (slotExpanded) {
 		switch (expandedSubSlot(address)) {
 			case 0:
-				return (address < 0x8000) ? peekUnapiROM(address) : 0xFF;
+				return userRomEnabled ? peekUserROM(address) : 0xFF;
 			case 1:
-				if (userRomEnabled) return peekUserROM(address);
-				return rom[address - 0x4000];
+				return (address < 0x8000) ? peekUnapiROM(address) : 0xFF;
+			case 2:
+				return userRomEnabled ? 0xFF : rom[address - 0x4000];
 			default:
 				return 0xFF;
 		}
