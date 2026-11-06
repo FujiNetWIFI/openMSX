@@ -9,15 +9,20 @@
     <description>FujiNet Network Adapter</description>
   </info>
   <devices>
+    <!-- No <secondary>: the adapter decodes FFFFh itself. openMSX only passes
+         FFFFh to a device in a slot it does not treat as expanded, and cannot
+         expand a slot at run time. -->
     <primary slot="any">
-      <secondary slot="any">
-        <FujiNet id="FujiNet">
-          <mem base="0x4000" size="0x8000" />
-          <rom>
-            <filename>fujinet-config.rom</filename>
-          </rom>
-        </FujiNet>
-      </secondary>
+      <FujiNet id="FujiNet">
+        <mem base="0x4000" size="0x8000" />
+        <mem base="0xC000" size="0x4000" />
+        <rom>
+          <filename>fujinet-config.rom</filename>
+        </rom>
+        <rom id="unapirom">
+          <filename>fujinet-unapi.rom</filename>
+        </rom>
+      </FujiNet>
     </primary>
   </devices>
 </msxconfig>
