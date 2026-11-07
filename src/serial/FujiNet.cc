@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #else
 #include <sys/fcntl.h>
+#include <netinet/tcp.h>
 #endif
 #include <stdio.h>
 
@@ -27,15 +28,31 @@ static constexpr size_t IO_GETC_ADDR    = 0xBFFC;
 static constexpr size_t IO_STATUS_ADDR  = 0xBFFD;
 static constexpr size_t IO_PUTC_ADDR    = 0xBFFE;
 static constexpr size_t IO_CONTROL_ADDR = 0xBFFF;
+static constexpr size_t IO_FLAG_DATA_AVAIL          = 0x80;
 static constexpr size_t IO_FLAG_USERROM_READY       = 0x40;
 static constexpr size_t IO_FLAG_ROM_MODE_CMD        = 0b00000100;
 static constexpr size_t IO_FLAG_USERROM_ENABLE      = 0b00000001;
-static constexpr size_t IO_FLAG_AUTOSTART_ENABLE    = 0b00000010;
+static constexpr size_t IO_FLAG_UNAPI_ENABLE        = 0b00010000;
+static constexpr size_t IO_FLAG_EXPAND_SLOT         = 0b00100000;
+
+// Rom's constructor throws when the id is missing; the UNAPI image is optional.
+static bool hasRomWithId(DeviceConfig& config, std::string_view id)
+{
+    for (const auto* c : config.getXML()->getChildren("rom")) {
+        if (c->getAttributeValue("id", {}) == id) {
+            return true;
+        }
+    }
+    return false;
+}
 
 FujiNet::FujiNet(DeviceConfig& config)
     : MSXDevice(config)
     , rom(getName() + " ROM", "rom", config)
     , userRom(0)
+    , unapiRom(hasRomWithId(config, "unapirom")
+        ? std::optional<Rom>(std::in_place, getName() + " UNAPI ROM", "rom", config, "unapirom")
+        : std::nullopt)
     , debugMode(
         getCommandController(), "fujinet_debug",
         "Enable FujiNet debug logging", false)
@@ -46,6 +63,11 @@ FujiNet::FujiNet(DeviceConfig& config)
     romEnabled = true;
     userRomEnabled = false;
     userRomLoaded = false;
+    userRomOpen = false;
+    userRomExpected = 0;
+    unapiEnabled = true;
+    slotExpanded = true;
+    subSlotReg = 0;
     userRomType = FUJI_ROM_MSX_PLAIN;
     userRomBankSize = 0x4000;
 }
@@ -99,6 +121,10 @@ void FujiNet::readSocket()
 				Timer::sleep(1'000'000); // retry once per second
 				continue;
 			}
+			// One send() per PUTC byte; Nagle would stall each request.
+			int one = 1;
+			setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
+			           reinterpret_cast<char*>(&one), sizeof(one));
 		}
 #ifndef _WIN32
 		if (poller.poll(sock)) {
@@ -122,12 +148,17 @@ void FujiNet::readSocket()
                 rxBuffer.push_back(buf[i]);
             }
 
-            auto packet = readBusPacket();
+            size_t frameEnd = 0;
+            auto packet = readBusPacket(frameEnd);
             if (!packet) {
                 continue;
             }
 
+            // Only DBC frames are consumed; the rest stay for the MSX's GETC.
             if (packet->device() == FUJI_DEVICEID_DBC) {
+                for (size_t i = 0; i < frameEnd; ++i) {
+                    rxBuffer.pop_front();
+                }
                 handleDBCCommand(std::move(packet));
             }
         }
@@ -136,55 +167,140 @@ void FujiNet::readSocket()
 
 void FujiNet::handleDBCCommand(std::unique_ptr<FujiBusPacket> packet)
 {
-    // Don't pass DCB commands to MSX
-    rxBuffer.clear();
-
     switch (packet->command()) {
-        case FUJICMD_OPEN:
+        case FUJICMD_OPEN: {
             fnDebugLog("FUJICMD_OPEN");
-            clearUserROM();
-            // TODO: Also set offset from first param
-            // FujiNet sends the type only for a tagged MSX megaROM
-            // ("game[ASCII8].rom"); anything else is a plain ROM.
-            {
-                auto type = packet->paramCount() > 1
-                          ? (fujiROMType_t)packet->param(1)
-                          : FUJI_ROM_MSX_PLAIN;
-                fnDebugLog("fujiROMType: ", (unsigned)type);
-                setUserROMType(type);
+
+            uint8_t stream_id;
+            uint32_t declared;
+            fujiROMType_t rt;
+
+            const auto& data = packet->data();
+            if (data && data->size() >= 5) {
+                stream_id = (*data)[0];
+                declared = (static_cast<uint32_t>((*data)[1])      ) |
+                           (static_cast<uint32_t>((*data)[2]) <<  8) |
+                           (static_cast<uint32_t>((*data)[3]) << 16) |
+                           (static_cast<uint32_t>((*data)[4]) << 24);
+                rt = (data->size() >= 6) ? static_cast<fujiROMType_t>((*data)[5])
+                                         : ROM_TYPE_UNKNOWN;
+            } else if (packet->paramCount() >= 1) {
+                // Legacy OPEN: params instead of a payload header.
+                stream_id = 0;
+                declared = 0;
+                rt = (packet->paramCount() >= 2)
+                         ? static_cast<fujiROMType_t>(packet->param(1))
+                         : ROM_TYPE_UNKNOWN;
+            } else {
+                fujiBusReply(false);
+                break;
             }
-            fujiBusAck();
+
+            if (rt == ROM_TYPE_UNKNOWN) {
+                rt = FUJI_ROM_MSX_PLAIN; // 0 would select 8K banks
+            }
+
+            if (stream_id != 0) {
+                fujiBusReply(false); // no .cfg concept on MSX
+                break;
+            }
+
+            clearUserROM();
+            userRomOpen = true;
+            userRomExpected = declared;
+            if (declared != 0 && declared <= (4u * 1024 * 1024)) {
+                userRom.reserve(declared);
+            }
+
+            fnDebugLog("fujiROMType: ", rt);
+            setUserROMType(rt);
+            fujiBusReply(true);
             break;
+        }
         case FUJICMD_WRITE:
             fnDebugLog("FUJICMD_WRITE");
-            if (packet->data())
-                writeUserROM(*(packet->data()));
-            fujiBusAck();
+            if (!userRomOpen || !packet->data()) {
+                fujiBusReply(false);
+                break;
+            }
+            writeUserROM(*(packet->data()));
+            fujiBusReply(true);
             break;
-        case FUJICMD_CLOSE:
+        case FUJICMD_CLOSE: {
             fnDebugLog("FUJICMD_CLOSE");
+            bool aborted = packet->data() && !packet->data()->empty() &&
+                           (*packet->data())[0] == 0x01;
+            if (!userRomOpen) {
+                fujiBusReply(false);
+                break;
+            }
+            userRomOpen = false;
+            userRomExpected = 0;
+            if (aborted) {
+                clearUserROM(); // must not leave userRomLoaded set
+                fujiBusReply(true);
+                break;
+            }
             if (userRom.size())
                 readyUserROM();
-            fujiBusAck();
+            fujiBusReply(true);
             break;
+        }
         default:
-            return;
+            fujiBusReply(false);
+            break;
     }
 }
 
-std::unique_ptr<FujiBusPacket> FujiNet::readBusPacket()
+// Isolates the first complete SLIP frame without touching rxBuffer;
+// frameEnd is the count of bytes through its closing END.
+std::unique_ptr<FujiBusPacket> FujiNet::readBusPacket(size_t& frameEnd)
 {
-    ByteBuffer packet;
-    for (auto c : rxBuffer) {
-        packet.push_back(c);
+    frameEnd = 0;
+
+    size_t i0 = 0;
+    bool found0 = false;
+    for (size_t i = 0; i < rxBuffer.size(); ++i) {
+        if (static_cast<uint8_t>(rxBuffer[i]) == SLIP_END) {
+            i0 = i;
+            found0 = true;
+            break;
+        }
     }
-    return FujiBusPacket::fromSerialized(packet);
+    if (!found0) {
+        return nullptr;
+    }
+
+    size_t i1 = 0;
+    bool found1 = false;
+    for (size_t i = i0 + 1; i < rxBuffer.size(); ++i) {
+        if (static_cast<uint8_t>(rxBuffer[i]) == SLIP_END) {
+            i1 = i;
+            found1 = true;
+            break;
+        }
+    }
+    if (!found1) {
+        return nullptr; // incomplete
+    }
+
+    ByteBuffer packet;
+    packet.reserve(i1 - i0 + 1);
+    for (size_t i = i0; i <= i1; ++i) {
+        packet.push_back(static_cast<uint8_t>(rxBuffer[i]));
+    }
+
+    auto result = FujiBusPacket::fromSerialized(packet);
+    if (result) {
+        frameEnd = i1 + 1;
+    }
+    return result;
 }
 
-void FujiNet::fujiBusAck()
+void FujiNet::fujiBusReply(bool ack)
 {
     if (sock != OPENMSX_INVALID_SOCKET) {
-        FujiBusPacket packet(FUJI_DEVICEID_DBC, FUJICMD_ACK);
+        FujiBusPacket packet(FUJI_DEVICEID_DBC, ack ? FUJICMD_ACK : FUJICMD_NAK);
         auto buf = packet.serialize();
         auto res = sock_send(sock, (const char*)buf.data(), buf.size());
         (void)res; // ignore error
@@ -309,21 +425,24 @@ void FujiNet::handleBankSwitch(uint16_t address, uint8_t value)
     }
 }
 
+// Resets don't reach the adapter; it keeps whatever mode was last set.
 void FujiNet::reset(EmuTime /*time*/)
+{
+}
+
+void FujiNet::powerUp(EmuTime /*time*/)
 {
     disableUserROM();
     enableROM();
+    unapiEnabled = true;
+    slotExpanded = true;
+    subSlotReg = 0;
 }
 
 uint8_t FujiNet::readMem(uint16_t address, EmuTime time)
 {
-	// The IO window is decoded whether or not a user ROM is mapped in. On real
-	// hardware IO_BASE is a fixed decode, so a user ROM must never be able to
-	// hide IO_GETC/IO_STATUS behind its own contents: appmake pads MSX ROM
-	// images with 0xFF, which reads back as "data available" forever and hangs
-	// every client in its wait-for-SLIP_END loop. peekMem() falls through to
-	// the user ROM for every other address.
 	auto value = peekMem(address, time);
+	if (!windowLiveAt(address)) return value;
 	switch (address) {
 		case IO_GETC_ADDR:
 			if (!rxBuffer.empty()) {
@@ -343,7 +462,7 @@ uint8_t FujiNet::readMem(uint16_t address, EmuTime time)
 			}
 			break;
 		case IO_STATUS_ADDR:
-            if (value == 0b10000000) {
+            if (value & IO_FLAG_DATA_AVAIL) {
                 fnDebugLog("FujiNet: STAT -> data available");
             } else {
                 fnDebugLog("FujiNet: STAT -> no data");
@@ -353,35 +472,92 @@ uint8_t FujiNet::readMem(uint16_t address, EmuTime time)
 	return value;
 }
 
+// Subslot selected for the page containing address (while expanded).
+int FujiNet::expandedSubSlot(uint16_t address) const
+{
+	return (subSlotReg >> ((address >> 14) * 2)) & 3;
+}
+
+// The IO window sits in subslot 1 when expanded, and is hidden by the user
+// ROM when not.
+bool FujiNet::windowLiveAt(uint16_t address) const
+{
+	if ((address < IO_GETC_ADDR) || (address > IO_CONTROL_ADDR)) return false;
+	if (slotExpanded) return expandedSubSlot(address) == 1;
+	return !userRomEnabled;
+}
+
+// Does a write at this address land in the user ROM (for bank switching)?
+bool FujiNet::userRomShownAt(uint16_t address) const
+{
+	if (!userRomEnabled) return false;
+	if (slotExpanded) return expandedSubSlot(address) == 0;
+	return !unapiEnabled;
+}
+
+uint8_t FujiNet::peekUnapiROM(uint16_t address) const
+{
+	if (!unapiRom) return 0xFF;
+	auto offset = size_t(address - 0x4000);
+	if (offset >= unapiRom->size()) return 0xFF;
+	return (*unapiRom)[offset];
+}
+
 uint8_t FujiNet::peekMem(uint16_t address, EmuTime /*time*/) const
 {
-	switch (address) {
-		case IO_GETC_ADDR: {
-			std::lock_guard lock(mtx);
-			if (!rxBuffer.empty()) {
-				return rxBuffer.front();
-			}
-			return 0x00;
+	// Page 3 only answers FFFFh while expanded; an unexpanded slot reads FFh,
+	// which is how the BIOS probe sees there is no expander.
+	if (address >= 0xC000) {
+		if ((address == 0xFFFF) && slotExpanded) {
+			return uint8_t(0xFF ^ subSlotReg);
 		}
-		case IO_STATUS_ADDR: {
-            // bit 7 when 1 means data available
-            // bit 6 when 1 means user rom is ready
-            // bit 6 when 0 means user rom is not ready
-			std::lock_guard lock(mtx);
-			uint8_t status = (userRomLoaded ? 0x40 : 0x00);
-			if (!rxBuffer.empty()) {
-				status |= 0x80;
-			}
-			return status;
-		}
-		default:
-			if (userRomEnabled)
-				return peekUserROM(address);
-			if (!romEnabled || address < 0x4000 || 0xC000 <= address)
-                return 0xFF;
-		    return rom[address - 0x4000];
-
+		return 0xFF;
 	}
+	if (address < 0x4000) return 0xFF;
+
+	if (windowLiveAt(address)) {
+		switch (address) {
+			case IO_GETC_ADDR: {
+				std::lock_guard lock(mtx);
+				if (!rxBuffer.empty()) {
+					return rxBuffer.front();
+				}
+				return 0x00;
+			}
+			case IO_STATUS_ADDR: {
+				// bit 7 when 1 means data available
+				// bit 6 when 1 means user rom is ready
+				// bit 6 when 0 means user rom is not ready
+				std::lock_guard lock(mtx);
+				uint8_t status = (userRomLoaded ? 0x40 : 0x00);
+				if (!rxBuffer.empty()) {
+					status |= 0x80;
+				}
+				return status;
+			}
+			default:
+				break;
+		}
+	}
+
+	if (slotExpanded) {
+		switch (expandedSubSlot(address)) {
+			case 0:
+				return userRomEnabled ? peekUserROM(address) : 0xFF;
+			case 1:
+				return (address < 0x8000) ? peekUnapiROM(address) : 0xFF;
+			case 2:
+				return userRomEnabled ? 0xFF : rom[address - 0x4000];
+			default:
+				return 0xFF;
+		}
+	}
+
+	if (unapiEnabled)
+		return (address < 0x8000) ? peekUnapiROM(address) : 0xFF;
+	if (userRomEnabled)
+		return peekUserROM(address);
+	return rom[address - 0x4000];
 }
 
 uint8_t FujiNet::peekUserROM(uint16_t address) const
@@ -420,41 +596,65 @@ uint8_t FujiNet::peekUserROM(uint16_t address) const
 void FujiNet::writeMem(uint16_t address, uint8_t value, EmuTime /*time*/)
 {
     std::lock_guard lock(mtx);
-    switch (address) {
-        case IO_PUTC_ADDR: // IO_PUTC
-            if (sock != OPENMSX_INVALID_SOCKET) {
-                if (debugMode.getBoolean()) {
-                    char formatted[16];
-                    if (value > 31 && value < 127)
-                        snprintf(formatted, 16, "$%02X %c", value, value);
-                    else
-                        snprintf(formatted, 16, "$%02X", value);
-                    fnDebugLog("FujiNet: PUTC ", formatted);
-                }
 
-                auto res = sock_send(sock, reinterpret_cast<const char*>(&value), 1);
-                (void)res; // ignore error
-            }
-            return;
-        case IO_CONTROL_ADDR:
-            if (value & IO_FLAG_ROM_MODE_CMD) {
-                if (value & IO_FLAG_USERROM_ENABLE) {
-                    enableUserROM();
+    if (address >= 0xC000) {
+        if ((address == 0xFFFF) && slotExpanded) {
+            subSlotReg = value;
+            fnDebugLog("FujiNet: subslot register <- ", int(value));
+        }
+        return;
+    }
+
+    if (windowLiveAt(address)) {
+        switch (address) {
+            case IO_PUTC_ADDR:
+                if (sock != OPENMSX_INVALID_SOCKET) {
+                    if (debugMode.getBoolean()) {
+                        char formatted[16];
+                        if (value > 31 && value < 127)
+                            snprintf(formatted, 16, "$%02X %c", value, value);
+                        else
+                            snprintf(formatted, 16, "$%02X", value);
+                        fnDebugLog("FujiNet: PUTC ", formatted);
+                    }
+
+                    auto res = sock_send(sock, reinterpret_cast<const char*>(&value), 1);
+                    (void)res; // ignore error
                 }
-                else {
-                    disableUserROM();
+                return;
+            case IO_CONTROL_ADDR:
+                // Only CONFIG sets the mode: once it has handed off, a stray
+                // write (a game's stack, a RAM probe) must not.
+                if (userRomEnabled || (unapiEnabled && !slotExpanded)) return;
+                if (value & IO_FLAG_ROM_MODE_CMD) {
+                    unapiEnabled = (value & IO_FLAG_UNAPI_ENABLE) != 0;
+                    bool wantExpanded = (value & IO_FLAG_EXPAND_SLOT) != 0;
+                    if (wantExpanded != slotExpanded) {
+                        subSlotReg = 0;
+                    }
+                    slotExpanded = wantExpanded;
+                    fnDebugLog("FujiNet: mode ", int(value),
+                               unapiEnabled ? " unapi" : "",
+                               slotExpanded ? " expanded" : "");
+
+                    if (value & IO_FLAG_USERROM_ENABLE) {
+                        enableUserROM();
+                        disableROM();
+                    }
+                    else {
+                        disableUserROM();
+                        enableROM();
+                    }
                 }
-                if (value & IO_FLAG_AUTOSTART_ENABLE) {
-                    enableROM();
-                }
-                else {
-                    disableROM();
-                }
-            }
-            return;
-        default:
-            handleBankSwitch(address, value);
-            return;
+                return;
+            default:
+                // other window addresses (GETC/STATUS) are not writable
+                return;
+        }
+    }
+
+    if (userRomShownAt(address)) {
+        handleBankSwitch(address, value);
     }
 }
 
