@@ -32,6 +32,7 @@ static constexpr size_t IO_FLAG_DATA_AVAIL          = 0x80;
 static constexpr size_t IO_FLAG_USERROM_READY       = 0x40;
 static constexpr size_t IO_FLAG_ROM_MODE_CMD        = 0b00000100;
 static constexpr size_t IO_FLAG_USERROM_ENABLE      = 0b00000001;
+static constexpr size_t IO_FLAG_USERROM_B_ENABLE    = 0b01000000;
 static constexpr size_t IO_FLAG_UNAPI_ENABLE        = 0b00010000;
 static constexpr size_t IO_FLAG_EXPAND_SLOT         = 0b00100000;
 
@@ -49,7 +50,6 @@ static bool hasRomWithId(DeviceConfig& config, std::string_view id)
 FujiNet::FujiNet(DeviceConfig& config)
     : MSXDevice(config)
     , rom(getName() + " ROM", "rom", config)
-    , userRom(0)
     , unapiRom(hasRomWithId(config, "unapirom")
         ? std::optional<Rom>(std::in_place, getName() + " UNAPI ROM", "rom", config, "unapirom")
         : std::nullopt)
@@ -60,16 +60,10 @@ FujiNet::FujiNet(DeviceConfig& config)
     thread = std::thread(&FujiNet::readSocket, this);
     stopReading = false;
 
-    romEnabled = true;
-    userRomEnabled = false;
-    userRomLoaded = false;
-    userRomOpen = false;
     userRomExpected = 0;
     unapiEnabled = true;
     slotExpanded = true;
     subSlotReg = 0;
-    userRomType = FUJI_ROM_MSX_PLAIN;
-    userRomBankSize = 0x4000;
 }
 
 FujiNet::~FujiNet()
@@ -200,49 +194,51 @@ void FujiNet::handleDBCCommand(std::unique_ptr<FujiBusPacket> packet)
                 rt = FUJI_ROM_MSX_PLAIN; // 0 would select 8K banks
             }
 
-            if (stream_id != 0) {
+            if (stream_id != 0 && stream_id != 2) {
                 fujiBusReply(false); // no .cfg concept on MSX
                 break;
             }
 
-            clearUserROM();
-            userRomOpen = true;
+            auto& img = userRoms[stream_id == 2 ? 1 : 0];
+            clearUserROM(img);
+            openImage = (stream_id == 2) ? 1 : 0;
             userRomExpected = declared;
             if (declared != 0 && declared <= (4u * 1024 * 1024)) {
-                userRom.reserve(declared);
+                img.data.reserve(declared);
             }
 
-            fnDebugLog("fujiROMType: ", rt);
-            setUserROMType(rt);
+            fnDebugLog("fujiROMType: ", rt, " stream: ", int(stream_id));
+            setUserROMType(img, rt);
             fujiBusReply(true);
             break;
         }
         case FUJICMD_WRITE:
             fnDebugLog("FUJICMD_WRITE");
-            if (!userRomOpen || !packet->data()) {
+            if (openImage < 0 || !packet->data()) {
                 fujiBusReply(false);
                 break;
             }
-            writeUserROM(*(packet->data()));
+            writeUserROM(userRoms[openImage], *(packet->data()));
             fujiBusReply(true);
             break;
         case FUJICMD_CLOSE: {
             fnDebugLog("FUJICMD_CLOSE");
             bool aborted = packet->data() && !packet->data()->empty() &&
                            (*packet->data())[0] == 0x01;
-            if (!userRomOpen) {
+            if (openImage < 0) {
                 fujiBusReply(false);
                 break;
             }
-            userRomOpen = false;
+            auto& img = userRoms[openImage];
+            openImage = -1;
             userRomExpected = 0;
             if (aborted) {
-                clearUserROM(); // must not leave userRomLoaded set
+                clearUserROM(img); // must not leave loaded set
                 fujiBusReply(true);
                 break;
             }
-            if (userRom.size())
-                readyUserROM();
+            if (img.data.size())
+                readyUserROM(img);
             fujiBusReply(true);
             break;
         }
@@ -307,117 +303,93 @@ void FujiNet::fujiBusReply(bool ack)
     }
 }
 
-void FujiNet::clearUserROM()
+void FujiNet::clearUserROM(UserRomImage& img)
 {
-    userRomLoaded = false;
-    userRom.clear();
+    img.loaded = false;
+    img.data.clear();
 }
 
-void FujiNet::writeUserROM(std::span<unsigned const char> data)
+void FujiNet::writeUserROM(UserRomImage& img, std::span<unsigned const char> data)
 {
     for (auto c : data) {
-        userRom.push_back(c);
+        img.data.push_back(c);
     }
 }
 
-void FujiNet::readyUserROM()
+void FujiNet::readyUserROM(UserRomImage& img)
 {
     fnDebugLog("FujiNet: readyUserROM");
-    userRomLoaded = true;
+    img.loaded = true;
 }
 
-void FujiNet::enableUserROM()
+void FujiNet::setUserROMType(UserRomImage& img, fujiROMType_t t)
 {
-    fnDebugLog("FujiNet: enabledUserROM");
-    userRomEnabled = true;
-}
+    img.type = t;
 
-void FujiNet::disableUserROM()
-{
-    fnDebugLog("FujiNet: disableUserROM");
-    userRomEnabled = false;
-}
-
-void FujiNet::enableROM()
-{
-    fnDebugLog("FujiNet: enabledROM");
-    romEnabled = true;
-}
-
-void FujiNet::disableROM()
-{
-    fnDebugLog("FujiNet: disableROM");
-    romEnabled = false;
-}
-
-void FujiNet::setUserROMType(fujiROMType_t t)
-{
-    userRomType = t;
-
-    switch (userRomType) {
+    switch (img.type) {
         case FUJI_ROM_MSX_ASCII8:
         case FUJI_ROM_MSX_KONAMI:
         case FUJI_ROM_MSX_KONAMI_SCC:
-            userRomBankSize = 0x2000;
+            img.bankSize = 0x2000;
             break;
         default:
-            userRomBankSize = 0x4000;
+            img.bankSize = 0x4000;
             break;
     }
 
     // Reset all banks to sequential
     for (uint8_t n = 0; n < MAX_BANKS; n++) {
-        setUserROMBank(n, n);
+        setUserROMBank(img, n, n);
     }
 }
 
-void FujiNet::setUserROMBank(uint8_t n, uint8_t block)
+void FujiNet::setUserROMBank(UserRomImage& img, uint8_t n, uint8_t block)
 {
-    uint32_t offset = block * userRomBankSize;
-    userRomMap[n] = offset;
+    uint32_t offset = block * img.bankSize;
+    img.map[n] = offset;
     char offset_str[8];
     snprintf(offset_str, 8, "%04X", offset);
     fnDebugLog("FujiNet: setUserROMBank n:", n, " block:", block, " offset:", offset_str);
 }
 
-void FujiNet::handleBankSwitch(uint16_t address, uint8_t value)
+void FujiNet::handleBankSwitch(UserRomImage& img, uint16_t address, uint8_t value)
 {
     char addr_str[8];
     snprintf(addr_str, 8, "%04X", address);
-    fnDebugLog("FujiNet: handleBankSwitch addr:", addr_str, " val:", value, " userRomType:", (uint8_t)userRomType);
+    fnDebugLog("FujiNet: handleBankSwitch addr:", addr_str, " val:", value, " userRomType:", (uint8_t)img.type);
 
     if (address < 0x4000 || address >= 0xC000)
         return;
 
-    switch (userRomType) {
+    switch (img.type) {
         case FUJI_ROM_MSX_ASCII8:
             if ((0x6000 <= address) && (address < 0x8000)) {
                 uint8_t bank = ((address >> 11) & 3);
-                setUserROMBank(bank, value);
+                setUserROMBank(img, bank, value);
             }
             break;
 
         case FUJI_ROM_MSX_ASCII16:
             if ((0x6000 <= address) && (address < 0x7800) && !(address & 0x0800)) {
-          		uint8_t bank = ((address >> 12) & 1);
-                setUserROMBank(bank, value);
-           	}
+                uint8_t bank = ((address >> 12) & 1);
+                setUserROMBank(img, bank, value);
+            }
             break;
 
         case FUJI_ROM_MSX_KONAMI:
             // Note: [0x4000..0x6000) is fixed at segment 0.
-           	if (0x6000 <= address && address < 0xC000) {
+            if (0x6000 <= address && address < 0xC000) {
                 uint8_t bank = (address >> 13) - 2;
-          		setUserROMBank(bank, value);
-           	}
+                setUserROMBank(img, bank, value);
+            }
             break;
 
         case FUJI_ROM_MSX_KONAMI_SCC: // Konami+SCC; TODO: use real enum
-           	if (0x5000 <= address && address < 0xC000 && (address & 0x1800) == 0x1000) {
-          		uint8_t bank = (address >> 13) - 2;
-          		setUserROMBank(bank, value);
-          		// TODO: if bank = 4 clear SCC cache
-           	}
+            if (0x5000 <= address && address < 0xC000 && (address & 0x1800) == 0x1000) {
+                uint8_t bank = (address >> 13) - 2;
+                setUserROMBank(img, bank, value);
+                // TODO: if bank = 4 clear SCC cache
+            }
             break;
 
         default:
@@ -432,8 +404,7 @@ void FujiNet::reset(EmuTime /*time*/)
 
 void FujiNet::powerUp(EmuTime /*time*/)
 {
-    disableUserROM();
-    enableROM();
+    for (auto& img : userRoms) img.enabled = false;
     unapiEnabled = true;
     slotExpanded = true;
     subSlotReg = 0;
@@ -484,15 +455,13 @@ bool FujiNet::windowLiveAt(uint16_t address) const
 {
 	if ((address < IO_GETC_ADDR) || (address > IO_CONTROL_ADDR)) return false;
 	if (slotExpanded) return expandedSubSlot(address) == 1;
-	return !userRomEnabled;
+	return !userRoms[0].enabled;
 }
 
-// Does a write at this address land in the user ROM (for bank switching)?
-bool FujiNet::userRomShownAt(uint16_t address) const
+// CONFIG is visible only while nothing else is enabled.
+bool FujiNet::configMode() const
 {
-	if (!userRomEnabled) return false;
-	if (slotExpanded) return expandedSubSlot(address) == 0;
-	return !unapiEnabled;
+	return !userRoms[0].enabled && !userRoms[1].enabled;
 }
 
 uint8_t FujiNet::peekUnapiROM(uint16_t address) const
@@ -529,7 +498,8 @@ uint8_t FujiNet::peekMem(uint16_t address, EmuTime /*time*/) const
 				// bit 6 when 1 means user rom is ready
 				// bit 6 when 0 means user rom is not ready
 				std::lock_guard lock(mtx);
-				uint8_t status = (userRomLoaded ? 0x40 : 0x00);
+				bool ready = openImage < 0 && (userRoms[0].loaded || userRoms[1].loaded);
+				uint8_t status = (ready ? 0x40 : 0x00);
 				if (!rxBuffer.empty()) {
 					status |= 0x80;
 				}
@@ -543,26 +513,27 @@ uint8_t FujiNet::peekMem(uint16_t address, EmuTime /*time*/) const
 	if (slotExpanded) {
 		switch (expandedSubSlot(address)) {
 			case 0:
-				return userRomEnabled ? peekUserROM(address) : 0xFF;
+				if (userRoms[0].enabled) return peekUserROM(userRoms[0], address);
+				return configMode() ? rom[address - 0x4000] : 0xFF;
 			case 1:
 				return (address < 0x8000) ? peekUnapiROM(address) : 0xFF;
 			case 2:
-				return userRomEnabled ? 0xFF : rom[address - 0x4000];
+				return 0xFF; // reserved for Nextor
 			default:
-				return 0xFF;
+				return userRoms[1].enabled ? peekUserROM(userRoms[1], address) : 0xFF;
 		}
 	}
 
 	if (unapiEnabled)
 		return (address < 0x8000) ? peekUnapiROM(address) : 0xFF;
-	if (userRomEnabled)
-		return peekUserROM(address);
+	if (userRoms[0].enabled)
+		return peekUserROM(userRoms[0], address);
 	return rom[address - 0x4000];
 }
 
-uint8_t FujiNet::peekUserROM(uint16_t address) const
+uint8_t FujiNet::peekUserROM(const UserRomImage& img, uint16_t address) const
 {
-    switch (userRomType) {
+    switch (img.type) {
         case FUJI_ROM_MSX_KONAMI:
             // [0x0000, 0x4000) mirrors [0x4000, 0x8000)
             if (address < 0x4000) address += 0x4000;
@@ -581,16 +552,16 @@ uint8_t FujiNet::peekUserROM(uint16_t address) const
             break;
     }
 
-    uint16_t bank = (address - 0x4000) / userRomBankSize;
+    uint16_t bank = (address - 0x4000) / img.bankSize;
     if (bank >= MAX_BANKS) return 0xFF;
-    uint32_t offset = userRomMap[bank];
+    uint32_t offset = img.map[bank];
 
     // A user ROM smaller than the mapped window (e.g. a 16K image seen at
     // 0x8000..0xBFFF) would otherwise index past the end of the vector.
-    size_t idx = offset + address - 0x4000 - bank * userRomBankSize;
-    if (idx >= userRom.size()) return 0xFF;
+    size_t idx = offset + address - 0x4000 - bank * img.bankSize;
+    if (idx >= img.data.size()) return 0xFF;
 
-    return userRom[idx];
+    return img.data[idx];
 }
 
 void FujiNet::writeMem(uint16_t address, uint8_t value, EmuTime /*time*/)
@@ -625,7 +596,8 @@ void FujiNet::writeMem(uint16_t address, uint8_t value, EmuTime /*time*/)
             case IO_CONTROL_ADDR:
                 // Only CONFIG sets the mode: once it has handed off, a stray
                 // write (a game's stack, a RAM probe) must not.
-                if (userRomEnabled || (unapiEnabled && !slotExpanded)) return;
+                if (userRoms[0].enabled || userRoms[1].enabled ||
+                    (unapiEnabled && !slotExpanded)) return;
                 if (value & IO_FLAG_ROM_MODE_CMD) {
                     unapiEnabled = (value & IO_FLAG_UNAPI_ENABLE) != 0;
                     bool wantExpanded = (value & IO_FLAG_EXPAND_SLOT) != 0;
@@ -637,14 +609,10 @@ void FujiNet::writeMem(uint16_t address, uint8_t value, EmuTime /*time*/)
                                unapiEnabled ? " unapi" : "",
                                slotExpanded ? " expanded" : "");
 
-                    if (value & IO_FLAG_USERROM_ENABLE) {
-                        enableUserROM();
-                        disableROM();
-                    }
-                    else {
-                        disableUserROM();
-                        enableROM();
-                    }
+                    userRoms[0].enabled = (value & IO_FLAG_USERROM_ENABLE) != 0;
+                    userRoms[1].enabled = slotExpanded && (value & IO_FLAG_USERROM_B_ENABLE) != 0;
+                    fnDebugLog("FujiNet: ROM A ", userRoms[0].enabled,
+                               " B ", userRoms[1].enabled);
                 }
                 return;
             default:
@@ -653,8 +621,19 @@ void FujiNet::writeMem(uint16_t address, uint8_t value, EmuTime /*time*/)
         }
     }
 
-    if (userRomShownAt(address)) {
-        handleBankSwitch(address, value);
+    if (slotExpanded) {
+        switch (expandedSubSlot(address)) {
+            case 0:
+                if (userRoms[0].enabled) handleBankSwitch(userRoms[0], address, value);
+                break;
+            case 3:
+                if (userRoms[1].enabled) handleBankSwitch(userRoms[1], address, value);
+                break;
+            default:
+                break;
+        }
+    } else if (userRoms[0].enabled && !unapiEnabled) {
+        handleBankSwitch(userRoms[0], address, value);
     }
 }
 
