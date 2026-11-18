@@ -48,39 +48,38 @@ private:
 	void handleDBCCommand(std::unique_ptr<FujiBusPacket> packet);
 	void fujiBusReply(bool ack);
 
-	void enableROM();
-	void disableROM();
-	void clearUserROM();
-	void writeUserROM(std::span<unsigned const char> data);
-	void readyUserROM();
-	void enableUserROM();
-	void disableUserROM();
-	void setUserROMType(fujiROMType_t t);
+	struct UserRomImage {
+		std::vector<std::uint8_t> data;
+		std::array<std::uint32_t, MAX_BANKS> map{};
+		fujiROMType_t type = FUJI_ROM_MSX_PLAIN;
+		uint16_t bankSize = 0x4000;
+		bool enabled = false;
+		bool loaded = false;
+	};
+
+	void clearUserROM(UserRomImage& img);
+	void writeUserROM(UserRomImage& img, std::span<unsigned const char> data);
+	void readyUserROM(UserRomImage& img);
+	void setUserROMType(UserRomImage& img, fujiROMType_t t);
+	void setUserROMBank(UserRomImage& img, uint8_t n, uint8_t block);
+	[[nodiscard]] uint8_t peekUserROM(const UserRomImage& img, uint16_t address) const;
+	void handleBankSwitch(UserRomImage& img, uint16_t address, uint8_t value);
 	[[nodiscard]] bool windowLiveAt(uint16_t address) const;
-	[[nodiscard]] bool userRomShownAt(uint16_t address) const;
+	[[nodiscard]] bool configMode() const;
 	[[nodiscard]] int expandedSubSlot(uint16_t address) const;
 	[[nodiscard]] uint8_t peekUnapiROM(uint16_t address) const;
-	void setUserROMBank(uint8_t n, uint8_t block);
-	uint8_t peekUserROM(uint16_t address) const;
-	void handleBankSwitch(uint16_t address, uint8_t value);
 
 	template <typename... Args>
 	void fnDebugLog(Args&&... args);
 
 	Rom rom;
-	bool romEnabled;
-	std::vector<std::uint8_t> userRom;
-	std::array<std::uint32_t, MAX_BANKS> userRomMap;
 	std::optional<Rom> unapiRom;
-	fujiROMType_t userRomType;
-	bool userRomEnabled;
-	bool userRomLoaded;
-	bool userRomOpen;
+	std::array<UserRomImage, 2> userRoms; // 0 = A, 1 = B
+	int openImage = -1; // image receiving a DBC download, -1 = none
 	uint32_t userRomExpected;
 	bool unapiEnabled;
 	bool slotExpanded;
 	uint8_t subSlotReg; // written via FFFFh while expanded
-	uint16_t userRomBankSize;
 	BooleanSetting debugMode;
 	std::thread thread; // receiving thread (reads from pty)
 	Poller poller; // to abort read-thread in a portable way
