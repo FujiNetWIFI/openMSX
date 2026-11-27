@@ -7,6 +7,8 @@
 #include "fujiDeviceID.h"
 #include "fujiRomType.h"
 #include "serialize.hh"
+#include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <sys/types.h>
@@ -35,6 +37,11 @@ static constexpr size_t IO_FLAG_USERROM_ENABLE      = 0b00000001;
 static constexpr size_t IO_FLAG_USERROM_B_ENABLE    = 0b01000000;
 static constexpr size_t IO_FLAG_UNAPI_ENABLE        = 0b00010000;
 static constexpr size_t IO_FLAG_EXPAND_SLOT         = 0b00100000;
+
+// DBC mapper commands (0x41 and 0x4D have other names in fujiCommandID.h).
+static constexpr uint8_t DBC_MAPPER_SET_INFO   = 0x49; // 'I'
+static constexpr uint8_t DBC_MAPPER_ADD_WINDOW = 0x41; // 'A'
+static constexpr uint8_t DBC_MAPPER_ADD_MIRROR = 0x4D; // 'M'
 
 // Rom's constructor throws when the id is missing; the UNAPI image is optional.
 static bool hasRomWithId(DeviceConfig& config, std::string_view id)
@@ -161,7 +168,7 @@ void FujiNet::readSocket()
 
 void FujiNet::handleDBCCommand(std::unique_ptr<FujiBusPacket> packet)
 {
-    switch (packet->command()) {
+    switch (static_cast<uint8_t>(packet->command())) {
         case FUJICMD_OPEN: {
             fnDebugLog("FUJICMD_OPEN");
 
@@ -190,10 +197,6 @@ void FujiNet::handleDBCCommand(std::unique_ptr<FujiBusPacket> packet)
                 break;
             }
 
-            if (rt == ROM_TYPE_UNKNOWN) {
-                rt = FUJI_ROM_MSX_PLAIN; // 0 would select 8K banks
-            }
-
             if (stream_id != 0 && stream_id != 2) {
                 fujiBusReply(false); // no .cfg concept on MSX
                 break;
@@ -202,14 +205,57 @@ void FujiNet::handleDBCCommand(std::unique_ptr<FujiBusPacket> packet)
             auto& img = userRoms[stream_id == 2 ? 1 : 0];
             clearUserROM(img);
             openImage = (stream_id == 2) ? 1 : 0;
+            layoutImage = openImage;
             userRomExpected = declared;
             if (declared != 0 && declared <= (4u * 1024 * 1024)) {
                 img.data.reserve(declared);
             }
 
             fnDebugLog("fujiROMType: ", rt, " stream: ", int(stream_id));
-            setUserROMType(img, rt);
+            // No type: no windows, which already means flat. The firmware
+            // sends the layout with the DBC mapper commands instead.
+            resetWindows(img);
+            if (rt != ROM_TYPE_UNKNOWN)
+                setLayoutType(img, rt);
             fujiBusReply(true);
+            break;
+        }
+        case DBC_MAPPER_SET_INFO: {
+            auto& img = userRoms[openImage >= 0 ? openImage : layoutImage];
+            const auto& data = packet->data();
+            resetWindows(img);
+            if (data && !data->empty()) {
+                setLayoutType(img, static_cast<fujiROMType_t>((*data)[0]));
+            }
+            fnDebugLog("DBC_MAPPER_SET_INFO");
+            fujiBusReply(true);
+            break;
+        }
+        case DBC_MAPPER_ADD_WINDOW: {
+            auto& img = userRoms[openImage >= 0 ? openImage : layoutImage];
+            if (packet->paramCount() < 4) {
+                fujiBusReply(false);
+                break;
+            }
+            MapperWindow w;
+            w.regBase = packet->param(0);
+            w.regTop = packet->param(1);
+            w.windowBase = packet->param(2);
+            w.windowTop = packet->param(3);
+            fujiBusReply(addWindow(img, w));
+            break;
+        }
+        case DBC_MAPPER_ADD_MIRROR: {
+            auto& img = userRoms[openImage >= 0 ? openImage : layoutImage];
+            if (packet->paramCount() < 3) {
+                fujiBusReply(false);
+                break;
+            }
+            MapperMirror m;
+            m.mirrorBase = packet->param(0);
+            m.mirrorTop = packet->param(1);
+            m.source = packet->param(2);
+            fujiBusReply(addMirror(img, m));
             break;
         }
         case FUJICMD_WRITE:
@@ -319,81 +365,135 @@ void FujiNet::writeUserROM(UserRomImage& img, std::span<unsigned const char> dat
 void FujiNet::readyUserROM(UserRomImage& img)
 {
     fnDebugLog("FujiNet: readyUserROM");
+    setROMSize(img, img.data.size());
+    activateUserROM(img);
     img.loaded = true;
 }
 
-void FujiNet::setUserROMType(UserRomImage& img, fujiROMType_t t)
+void FujiNet::resetWindows(UserRomImage& img)
 {
-    img.type = t;
+    img.windows.fill({});
+    img.windowCount = 0;
+    img.mirrorCount = 0;
+    img.windowBase = UINT_MAX;
+    img.windowTop = 0;
+    img.registerBase = UINT_MAX;
+    img.registerTop = 0;
+    img.mappedBase = UINT_MAX;
+    img.mappedTop = 0;
+}
 
-    switch (img.type) {
+static void extend(unsigned& base, unsigned& top, unsigned newBase, unsigned newTop)
+{
+    if (newBase < base) base = newBase;
+    if (newTop > top) top = newTop;
+}
+
+bool FujiNet::addWindow(UserRomImage& img, const MapperWindow& w)
+{
+    if (img.windowCount >= MAX_WINDOWS) return false;
+    img.windows[img.windowCount] = w;
+
+    // Always sized by window 0, as the bus controller does.
+    auto newWS = uint16_t(img.windows[0].windowTop - img.windows[0].windowBase);
+    if (newWS < 0x10000 / 64) return false;
+
+    extend(img.windowBase, img.windowTop, w.windowBase, w.windowTop);
+    extend(img.mappedBase, img.mappedTop, img.windowBase, img.windowTop);
+    if (w.regBase != w.regTop) {
+        extend(img.registerBase, img.registerTop, w.regBase, w.regTop);
+    }
+    img.windowSize = newWS;
+    img.windowShift = uint16_t(std::countr_zero(unsigned(newWS)));
+    img.windowCount++;
+    fnDebugLog("FujiNet: window ", img.windowCount - 1,
+               " reg:", w.regBase, "-", w.regTop,
+               " win:", w.windowBase, "-", w.windowTop);
+    return true;
+}
+
+bool FujiNet::addMirror(UserRomImage& img, const MapperMirror& m)
+{
+    if (img.mirrorCount >= MAX_MIRRORS) return false;
+    img.mirrors[img.mirrorCount] = m;
+    extend(img.mappedBase, img.mappedTop, m.mirrorBase, m.mirrorTop);
+    img.mirrorCount++;
+    fnDebugLog("FujiNet: mirror ", m.mirrorBase, "-", m.mirrorTop,
+               " source:", m.source);
+    return true;
+}
+
+// The built-in MSX layouts (the bus controller's Mapper::setROMType).
+void FujiNet::setLayoutType(UserRomImage& img, fujiROMType_t t)
+{
+    resetWindows(img);
+    auto win = [&](uint32_t rb, uint32_t rt, uint32_t wb, uint32_t wt) {
+        MapperWindow w;
+        w.regBase = rb; w.regTop = rt; w.windowBase = wb; w.windowTop = wt;
+        (void)addWindow(img, w);
+    };
+    auto mir = [&](uint32_t mb, uint32_t mt, uint32_t src) {
+        MapperMirror m;
+        m.mirrorBase = mb; m.mirrorTop = mt; m.source = src;
+        (void)addMirror(img, m);
+    };
+    switch (t) {
         case FUJI_ROM_MSX_ASCII8:
+            win(0x6000, 0x6800, 0x4000, 0x6000);
+            win(0x6800, 0x7000, 0x6000, 0x8000);
+            win(0x7000, 0x7800, 0x8000, 0xA000);
+            win(0x7800, 0x8000, 0xA000, 0xC000);
+            break;
+        case FUJI_ROM_MSX_ASCII16:
+            win(0x6000, 0x6800, 0x4000, 0x8000);
+            win(0x7000, 0x7800, 0x8000, 0xC000);
+            break;
         case FUJI_ROM_MSX_KONAMI:
+            win(0x0000, 0x0000, 0x4000, 0x6000);
+            win(0x6000, 0x8000, 0x6000, 0x8000);
+            win(0x8000, 0xA000, 0x8000, 0xA000);
+            win(0xA000, 0xC000, 0xA000, 0xC000);
+            mir(0x0000, 0x4000, 0x4000);
+            mir(0xC000, 0x10000, 0x8000);
+            break;
         case FUJI_ROM_MSX_KONAMI_SCC:
-            img.bankSize = 0x2000;
+            win(0x5000, 0x5800, 0x4000, 0x6000);
+            win(0x7000, 0x7800, 0x6000, 0x8000);
+            win(0x9000, 0x9800, 0x8000, 0xA000);
+            win(0xB000, 0xB800, 0xA000, 0xC000);
+            mir(0x0000, 0x4000, 0x8000);
+            mir(0xC000, 0x10000, 0x4000);
             break;
         default:
-            img.bankSize = 0x4000;
             break;
-    }
-
-    // Reset all banks to sequential
-    for (uint8_t n = 0; n < MAX_BANKS; n++) {
-        setUserROMBank(img, n, n);
     }
 }
 
-void FujiNet::setUserROMBank(UserRomImage& img, uint8_t n, uint8_t block)
+void FujiNet::setROMSize(UserRomImage& img, size_t size)
 {
-    uint32_t offset = block * img.bankSize;
-    img.map[n] = offset;
-    char offset_str[8];
-    snprintf(offset_str, 8, "%04X", offset);
-    fnDebugLog("FujiNet: setUserROMBank n:", n, " block:", block, " offset:", offset_str);
+    img.bankCount = uint16_t(std::max<size_t>(1, (size + img.windowSize - 1) / img.windowSize));
+}
+
+void FujiNet::activateUserROM(UserRomImage& img)
+{
+    for (unsigned i = 0; i < img.windowCount; ++i) {
+        img.windows[i].bank = uint8_t(i);
+    }
 }
 
 void FujiNet::handleBankSwitch(UserRomImage& img, uint16_t address, uint8_t value)
 {
-    char addr_str[8];
-    snprintf(addr_str, 8, "%04X", address);
-    fnDebugLog("FujiNet: handleBankSwitch addr:", addr_str, " val:", value, " userRomType:", (uint8_t)img.type);
-
-    if (address < 0x4000 || address >= 0xC000)
-        return;
-
-    switch (img.type) {
-        case FUJI_ROM_MSX_ASCII8:
-            if ((0x6000 <= address) && (address < 0x8000)) {
-                uint8_t bank = ((address >> 11) & 3);
-                setUserROMBank(img, bank, value);
-            }
-            break;
-
-        case FUJI_ROM_MSX_ASCII16:
-            if ((0x6000 <= address) && (address < 0x7800) && !(address & 0x0800)) {
-                uint8_t bank = ((address >> 12) & 1);
-                setUserROMBank(img, bank, value);
-            }
-            break;
-
-        case FUJI_ROM_MSX_KONAMI:
-            // Note: [0x4000..0x6000) is fixed at segment 0.
-            if (0x6000 <= address && address < 0xC000) {
-                uint8_t bank = (address >> 13) - 2;
-                setUserROMBank(img, bank, value);
-            }
-            break;
-
-        case FUJI_ROM_MSX_KONAMI_SCC: // Konami+SCC; TODO: use real enum
-            if (0x5000 <= address && address < 0xC000 && (address & 0x1800) == 0x1000) {
-                uint8_t bank = (address >> 13) - 2;
-                setUserROMBank(img, bank, value);
-                // TODO: if bank = 4 clear SCC cache
-            }
-            break;
-
-        default:
-            break;
+    if (address < img.registerBase || address >= img.registerTop) return;
+    for (unsigned i = 0; i < img.windowCount; ++i) {
+        auto& w = img.windows[i];
+        if (w.regBase <= address && address < w.regTop) {
+            w.bank = uint8_t(value & (img.bankCount - 1));
+            char addr_str[8];
+            snprintf(addr_str, 8, "%04X", address);
+            fnDebugLog("FujiNet: bank switch addr:", addr_str, " val:", value,
+                       " window:", i, " bank:", int(w.bank));
+            return;
+        }
     }
 }
 
@@ -533,35 +633,28 @@ uint8_t FujiNet::peekMem(uint16_t address, EmuTime /*time*/) const
 
 uint8_t FujiNet::peekUserROM(const UserRomImage& img, uint16_t address) const
 {
-    switch (img.type) {
-        case FUJI_ROM_MSX_KONAMI:
-            // [0x0000, 0x4000) mirrors [0x4000, 0x8000)
-            if (address < 0x4000) address += 0x4000;
-            // [0xC000, 0x10000) mirrors [0x8000, 0xC000)
-            else if (address >= 0xC000) address -= 0x4000;
-            break;
-
-        case FUJI_ROM_MSX_KONAMI_SCC:
-            // [0x0000, 0x4000) mirrors [0xC000, 0x10000)
-            if (address < 0x4000) address += 0x8000;
-            // [0xC000, 0x10000) mirrors [0x4000, 0x8000)
-            else if (address >= 0xC000) address -= 0x8000;
-            break;
-
-        default:
-            break;
+    int64_t offset;
+    if (img.windowCount == 0) {
+        if (address < 0x4000 || address >= 0xC000) return 0xFF;
+        offset = address - 0x4000;
+    } else {
+        if (address < img.mappedBase || address >= img.mappedTop) return 0xFF;
+        uint32_t romOffset = address;
+        for (unsigned i = 0; i < img.mirrorCount; ++i) {
+            const auto& m = img.mirrors[i];
+            if (m.mirrorBase <= address && address < m.mirrorTop) {
+                romOffset = address + m.source - m.mirrorBase;
+                break;
+            }
+        }
+        unsigned w = ((romOffset - img.windowBase) >> img.windowShift) &
+                     (img.windowCount - 1);
+        int64_t adj = int64_t(romOffset) +
+                      (int64_t(img.windows[w].bank) - int64_t(w)) * img.windowSize;
+        offset = adj - int64_t(img.windowBase);
     }
-
-    uint16_t bank = (address - 0x4000) / img.bankSize;
-    if (bank >= MAX_BANKS) return 0xFF;
-    uint32_t offset = img.map[bank];
-
-    // A user ROM smaller than the mapped window (e.g. a 16K image seen at
-    // 0x8000..0xBFFF) would otherwise index past the end of the vector.
-    size_t idx = offset + address - 0x4000 - bank * img.bankSize;
-    if (idx >= img.data.size()) return 0xFF;
-
-    return img.data[idx];
+    if (offset < 0 || size_t(offset) >= img.data.size()) return 0xFF;
+    return img.data[size_t(offset)];
 }
 
 void FujiNet::writeMem(uint16_t address, uint8_t value, EmuTime /*time*/)
@@ -609,8 +702,11 @@ void FujiNet::writeMem(uint16_t address, uint8_t value, EmuTime /*time*/)
                                unapiEnabled ? " unapi" : "",
                                slotExpanded ? " expanded" : "");
 
+                    bool wasA = userRoms[0].enabled, wasB = userRoms[1].enabled;
                     userRoms[0].enabled = (value & IO_FLAG_USERROM_ENABLE) != 0;
                     userRoms[1].enabled = slotExpanded && (value & IO_FLAG_USERROM_B_ENABLE) != 0;
+                    if (userRoms[0].enabled && !wasA) activateUserROM(userRoms[0]);
+                    if (userRoms[1].enabled && !wasB) activateUserROM(userRoms[1]);
                     fnDebugLog("FujiNet: ROM A ", userRoms[0].enabled,
                                " B ", userRoms[1].enabled);
                 }
