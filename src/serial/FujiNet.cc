@@ -19,10 +19,20 @@
 #include <netinet/tcp.h>
 #endif
 #include <stdio.h>
+#include <stdlib.h>
 
 #define FUJINET_DEFAULT_PORT     1985
 
 namespace openmsx {
+
+// FUJINET_PORT in the environment picks another fujinet-pc, so several
+// emulator/FujiNet pairs can run side by side.
+static uint16_t fujinetPort()
+{
+	const char* env = getenv("FUJINET_PORT");
+	int port = env ? atoi(env) : 0;
+	return (port > 0 && port < 65536) ? uint16_t(port) : FUJINET_DEFAULT_PORT;
+}
 
 // static constexpr size_t MAX_BUF_LEN     = 2 * 1024;
 static constexpr size_t MAX_BUF_LEN     = 0x40000;
@@ -114,7 +124,7 @@ void FujiNet::readSocket()
 
 			sockaddr_in addr{};
 			addr.sin_family = AF_INET;
-			addr.sin_port = htons(FUJINET_DEFAULT_PORT);
+			addr.sin_port = htons(fujinetPort());
 			addr.sin_addr.s_addr =
 			        htonl(INADDR_LOOPBACK); // 127.0.0.1
 			if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
