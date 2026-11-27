@@ -687,10 +687,14 @@ void FujiNet::writeMem(uint16_t address, uint8_t value, EmuTime /*time*/)
                 }
                 return;
             case IO_CONTROL_ADDR:
-                // Only CONFIG sets the mode: once it has handed off, a stray
-                // write (a game's stack, a RAM probe) must not.
-                if (userRoms[0].enabled || userRoms[1].enabled ||
-                    (unapiEnabled && !slotExpanded)) return;
+                // Expanded, the window is only here with subslot 1 switched
+                // into page 2, as the UNAPI call does, so a user ROM can set
+                // the mode (back to CONFIG, say) and a stray write from its
+                // own subslot can't. Unexpanded, only CONFIG sets it: once it
+                // has handed off, a stray write (a game's stack, a RAM probe)
+                // must not.
+                if (!slotExpanded &&
+                    (userRoms[0].enabled || unapiEnabled)) return;
                 if (value & IO_FLAG_ROM_MODE_CMD) {
                     unapiEnabled = (value & IO_FLAG_UNAPI_ENABLE) != 0;
                     bool wantExpanded = (value & IO_FLAG_EXPAND_SLOT) != 0;
