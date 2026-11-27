@@ -13,6 +13,8 @@
 #include "circular_buffer.hh"
 #include "fujiRomType.h"
 
+#include <array>
+#include <climits>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -26,8 +28,6 @@ class FujiNet final
     : public MSXDevice
 {
 public:
-    static constexpr unsigned MAX_BANKS = 4;
-
 	explicit FujiNet(DeviceConfig& config);
 	~FujiNet() override;
 
@@ -48,11 +48,32 @@ private:
 	void handleDBCCommand(std::unique_ptr<FujiBusPacket> packet);
 	void fujiBusReply(bool ack);
 
+	// Generic window/mirror bank switching, as in the bus controller's Mapper.
+	static constexpr unsigned MAX_WINDOWS = 8;
+	static constexpr unsigned MAX_MIRRORS = 8;
+
+	struct MapperWindow {
+		uint32_t regBase = 0, regTop = 0;
+		uint32_t windowBase = 0, windowTop = 0;
+		uint8_t bank = 0;
+	};
+	struct MapperMirror {
+		uint32_t mirrorBase = 0, mirrorTop = 0;
+		uint32_t source = 0;
+	};
+
 	struct UserRomImage {
 		std::vector<std::uint8_t> data;
-		std::array<std::uint32_t, MAX_BANKS> map{};
-		fujiROMType_t type = FUJI_ROM_MSX_PLAIN;
-		uint16_t bankSize = 0x4000;
+		std::array<MapperWindow, MAX_WINDOWS> windows{};
+		unsigned windowCount = 0;
+		std::array<MapperMirror, MAX_MIRRORS> mirrors{};
+		unsigned mirrorCount = 0;
+		uint16_t windowSize = 0x4000;
+		uint16_t windowShift = 14;
+		unsigned windowBase = UINT_MAX, windowTop = 0;
+		unsigned registerBase = UINT_MAX, registerTop = 0;
+		unsigned mappedBase = UINT_MAX, mappedTop = 0;
+		uint16_t bankCount = 1;
 		bool enabled = false;
 		bool loaded = false;
 	};
@@ -60,8 +81,12 @@ private:
 	void clearUserROM(UserRomImage& img);
 	void writeUserROM(UserRomImage& img, std::span<unsigned const char> data);
 	void readyUserROM(UserRomImage& img);
-	void setUserROMType(UserRomImage& img, fujiROMType_t t);
-	void setUserROMBank(UserRomImage& img, uint8_t n, uint8_t block);
+	void resetWindows(UserRomImage& img);
+	[[nodiscard]] bool addWindow(UserRomImage& img, const MapperWindow& w);
+	[[nodiscard]] bool addMirror(UserRomImage& img, const MapperMirror& m);
+	void setLayoutType(UserRomImage& img, fujiROMType_t t);
+	void setROMSize(UserRomImage& img, size_t size);
+	void activateUserROM(UserRomImage& img);
 	[[nodiscard]] uint8_t peekUserROM(const UserRomImage& img, uint16_t address) const;
 	void handleBankSwitch(UserRomImage& img, uint16_t address, uint8_t value);
 	[[nodiscard]] bool windowLiveAt(uint16_t address) const;
@@ -76,6 +101,7 @@ private:
 	std::optional<Rom> unapiRom;
 	std::array<UserRomImage, 2> userRoms; // 0 = A, 1 = B
 	int openImage = -1; // image receiving a DBC download, -1 = none
+	int layoutImage = 0; // most recently opened image, for layout commands
 	uint32_t userRomExpected;
 	bool unapiEnabled;
 	bool slotExpanded;
